@@ -1,6 +1,6 @@
 {
   "name": "app-crypto-kit",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "End-to-end file encryption for Expo apps on iOS and Android: AES-256-GCM on the device, main key in the Keychain / Keystore, a recovery key that unlocks it on a new device (iPhone or Android). The backend only ever stores ciphertext and a wrapped key. No app's words or backend are built in.",
   "main": "src/index.ts",
   "types": "src/index.ts",

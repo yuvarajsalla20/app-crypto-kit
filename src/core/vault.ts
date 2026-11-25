@@ -86,6 +86,32 @@ export function createCryptoKit(deps: CryptoKitDeps) {
     return key;
   }
 
+  /**
+   * Keys in use by an encrypt / decrypt that has not finished. clearMemory and forgetKeys drop them from memory at
+   * once, but zero their bytes only when that work ends: zeroing a key mid-encrypt would seal data under an all-zero
+   * key (and break a decrypt).
+   */
+  const busy = new Map<Uint8Array, number>();
+  const wipeWhenDone = new Set<Uint8Array>();
+  const drop = (key: Uint8Array) => (busy.has(key) ? wipeWhenDone.add(key) : wipe(key));
+
+  /** Runs `use` with the key (MissingKeyError when this device lacks it), keeping its bytes intact until it ends. */
+  async function withKey<T>(ns: string, keyId: string, use: (key: Uint8Array) => Promise<T>): Promise<T> {
+    const key = await loadKey(ns, keyId);
+    if (!key) throw new MissingKeyError(keyId);
+    busy.set(key, (busy.get(key) ?? 0) + 1);
+    try {
+      return await use(key);
+    } finally {
+      const left = (busy.get(key) ?? 1) - 1;
+      if (left > 0) busy.set(key, left);
+      else {
+        busy.delete(key);
+        if (wipeWhenDone.delete(key)) wipe(key);
+      }
+    }
+  }
+
   const lockboxAad = (keyId: string) => ascii(`app-crypto-kit/lockbox/v1/${keyId}`);
 
   async function wrapKey(keyId: string, key: Uint8Array, recoveryKey: string): Promise<Lockbox> {
@@ -174,10 +200,8 @@ export function createCryptoKit(deps: CryptoKitDeps) {
     async rotateRecoveryKey({ namespace, keyId }: Namespaced & { keyId?: string }): Promise<VaultSecret> {
       const id = keyId ?? (await activeKeyId({ namespace }));
       if (!id) throw new MissingKeyError('active');
-      const key = await loadKey(namespace, id);
-      if (!key) throw new MissingKeyError(id);
       const recoveryKey = encodeRecoveryKey(crypto.randomBytes(15));
-      const lockbox = await wrapKey(id, key, recoveryKey);
+      const lockbox = await withKey(namespace, id, (key) => wrapKey(id, key, recoveryKey));
       await store.set(names(namespace).recoveryKey(id), recoveryKey);
       return { lockbox, recoveryKey: formatRecoveryKey(recoveryKey), keyId: id };
     },
@@ -206,29 +230,30 @@ export function createCryptoKit(deps: CryptoKitDeps) {
     async encryptBytes({ namespace, data }: Namespaced & { data: Uint8Array }): Promise<Uint8Array> {
       const keyId = await activeKeyId({ namespace });
       if (!keyId) throw new MissingKeyError('active');
-      const key = await loadKey(namespace, keyId);
-      if (!key) throw new MissingKeyError(keyId);
       const head = header(keyId);
       const nonce = crypto.randomBytes(NONCE_LENGTH);
-      const body = await crypto.aesGcmEncrypt(key, nonce, data, head);
+      const body = await withKey(namespace, keyId, (key) => crypto.aesGcmEncrypt(key, nonce, data, head));
       return concat(head, nonce, body);
     },
 
     /** Decrypts with the key named in the data. MissingKeyError when this device lacks it; TamperedDataError when it fails. */
     async decryptBytes({ namespace, data }: Namespaced & { data: Uint8Array }): Promise<Uint8Array> {
       const parsed = parseSealed(data);
-      const key = await loadKey(namespace, parsed.keyId);
-      if (!key) throw new MissingKeyError(parsed.keyId);
-      try {
-        return await crypto.aesGcmDecrypt(key, parsed.nonce, parsed.body, parsed.header);
-      } catch {
-        throw new TamperedDataError();
-      }
+      return withKey(namespace, parsed.keyId, async (key) => {
+        try {
+          return await crypto.aesGcmDecrypt(key, parsed.nonce, parsed.body, parsed.header);
+        } catch {
+          throw new TamperedDataError();
+        }
+      });
     },
 
-    /** Drops keys held in memory (call on app lock); they are read again from secure storage when needed. */
+    /**
+     * Drops keys held in memory (call on app lock); they are read again from secure storage when needed. A key still
+     * in use by an unfinished encrypt / decrypt is zeroed when that ends, so that work is never corrupted.
+     */
     clearMemory(): void {
-      for (const key of memory.values()) wipe(key);
+      for (const key of memory.values()) drop(key);
       memory.clear();
     },
 
@@ -239,7 +264,7 @@ export function createCryptoKit(deps: CryptoKitDeps) {
         await store.delete(n.mainKey(id));
         await store.delete(n.recoveryKey(id));
         const m = memory.get(memoryName(namespace, id));
-        if (m) wipe(m);
+        if (m) drop(m);
         memory.delete(memoryName(namespace, id));
       }
       await store.delete(n.keyIds);
