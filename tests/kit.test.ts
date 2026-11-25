@@ -205,3 +205,29 @@ describe('vault', () => {
     await expect(device().createVault({ namespace: 'a/b' })).rejects.toThrow();
   });
 });
+
+describe('clearMemory during work', () => {
+  it('never zeroes a key that an unfinished encrypt is using', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let gated = false;
+    const slow: CryptoBackend = {
+      ...nodeCrypto,
+      async aesGcmEncrypt(key, nonce, plaintext, aad) {
+        if (gated) await gate;
+        return nodeCrypto.aesGcmEncrypt(key, nonce, plaintext, aad);
+      },
+    };
+    const kit = createCryptoKit({ crypto: slow, store: memoryStore(), scryptParams: { N: 1024, r: 8, p: 1 } });
+    await kit.createVault(ns);
+    gated = true;
+    const sealing = kit.encryptBytes({ ...ns, data: photo });
+    await new Promise((r) => setTimeout(r, 0));
+    kit.clearMemory(); // the app locked while a photo was being sealed
+    release();
+    const sealed = await sealing;
+    gated = false;
+    // Read again from secure storage: the photo opens, so it was not sealed under a zeroed key.
+    expect(await kit.decryptBytes({ ...ns, data: sealed })).toEqual(photo);
+  });
+});
